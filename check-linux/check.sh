@@ -143,7 +143,7 @@ run_interactive() {
     CONCURRENCY="$(read_input "请输入并发数" "$CONCURRENCY")"
 
     RUN_VALIDATE=1
-    SERVE_PORT="$(read_input "请输入下载服务端口" "8000")"
+    SERVE_PORT=8000
 
     echo ""
     banner "-------- 配置确认 --------"
