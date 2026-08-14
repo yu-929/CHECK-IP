@@ -8,7 +8,7 @@
 # ============================================================
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 
 # ---------------- 颜色与样式 ----------------
 C_RESET='\033[0m'
@@ -53,6 +53,7 @@ ${C_BOLD}Cloudflare 优选 IP 扫描（Linux CLI）${C_RESET}
   -o, --output <目录>  结果输出目录 (默认: history)
   -v, --validate       扫描后自动运行 validate.py 校验节点信息
   -s, --serve <端口>   扫描完成后启动 HTTP 下载服务，提供 CSV 下载链接
+  --install            安装为系统命令 ck (软链到 /usr/local/bin/ck)
   -h, --help           显示帮助
 
 环境变量: TARGET_LIST / ASN_LIST / CUSTOM_CF_DOMAIN / OUTPUT_DIR / SCAN_CONCURRENCY
@@ -63,6 +64,19 @@ ${C_BOLD}Cloudflare 优选 IP 扫描（Linux CLI）${C_RESET}
   ./check.sh -t "AS206300 AS13335" -p "443,13720" -c 5000
   ./check.sh -t 16.162.0.0/16 -p 443 -d example.com -v -s 8000
 EOF
+}
+
+# ---------------- 安装为 ck 命令 ----------------
+install_ck() {
+    local dest="/usr/local/bin/ck"
+    if ln -sf "$SCRIPT_DIR/check.sh" "$dest"; then
+        ok "已安装命令: ${C_BOLD}${dest}${C_RESET}"
+        ok "直接运行 ${C_BOLD}ck${C_RESET} 即可使用（交互模式）"
+        info "参数模式示例: ck -t AS206300 -p 443 -s 8000"
+    else
+        err "安装失败，请确认有 /usr/local/bin 写权限"
+        return 1
+    fi
 }
 
 # ---------------- 参数解析 ----------------
@@ -76,6 +90,7 @@ while [[ $# -gt 0 ]]; do
         -o|--output) OUTPUT_DIR="$2"; shift 2 ;;
         -v|--validate) RUN_VALIDATE=1; shift ;;
         -s|--serve) SERVE_PORT="$2"; shift 2 ;;
+        --install) install_ck; exit 0 ;;
         -h|--help) usage; exit 0 ;;
         *) err "未知参数: $1"; usage; exit 1 ;;
     esac

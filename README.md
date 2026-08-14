@@ -32,23 +32,25 @@ git clone https://github.com/yu-929/CHECK-IP.git
 cd CHECK-IP/check-linux
 ```
 
-### 3. 赋予执行权限并安装可选依赖
+### 3. 赋予执行权限并安装为系统命令
 
 ```bash
 chmod +x check.sh
 pip install --break-system-packages openpyxl
+./check.sh --install
 ```
 
 `openpyxl` 用于生成居中对齐的 XLSX 表格，不安装会自动回退为 HTML `.xls`。
+`./check.sh --install` 会把脚本软链到 `/usr/local/bin/ck`，之后直接运行 `ck` 即可。
 
 ### 4. 运行
 
 ```bash
 # 交互式向导（推荐）
-./check.sh
+ck
 
 # 参数模式：按 ASN 扫描并启动下载服务
-./check.sh -t AS206300 -p 443 -v -s 8000
+ck -t AS206300 -p 443 -v -s 8000
 ```
 
 ## 使用方法
@@ -69,6 +71,7 @@ pip install --break-system-packages openpyxl
   -o, --output <目录>    结果输出目录 (默认: history)
   -v, --validate         扫描后校验节点信息
   -s, --serve <端口>     扫描后启动 HTTP 下载服务
+  --install              安装为系统命令 ck (软链到 /usr/local/bin/ck)
   -h, --help             帮助
 ```
 
