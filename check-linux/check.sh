@@ -265,11 +265,43 @@ PYEOF
 }
 
 # ---------------- HTTP 下载服务 ----------------
+# 若 .http_server.pid 记录的旧服务仍存活，自动停止
+stop_old_download_server() {
+    local pidfile="$SCRIPT_DIR/.http_server.pid"
+    if [[ -f "$pidfile" ]]; then
+        local old_pid
+        old_pid="$(cat "$pidfile")"
+        if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
+            warn "检测到旧下载服务 (PID ${old_pid})，正在停止..."
+            kill "$old_pid" 2>/dev/null || true
+        fi
+        rm -f "$pidfile"
+    fi
+}
+
+# 查找第一个空闲端口（从 start 递增）
+find_free_port() {
+    local start="$1"
+    local port="$start"
+    while ss -tlnp 2>/dev/null | grep -q ":${port} " || (command -v netstat >/dev/null 2>&1 && netstat -tln 2>/dev/null | grep -q ":${port} "); do
+        port=$((port + 1))
+        if [[ "$port" -gt 65535 ]]; then
+            return 1
+        fi
+    done
+    echo "$port"
+}
+
 start_download_server() {
     local port="$1" dir="$2"
     if ! command -v python3 >/dev/null 2>&1; then
         err "启动下载服务需要 python3"
         return 1
+    fi
+    stop_old_download_server
+    port="$(find_free_port "$port")" || { err "未找到空闲端口"; return 1; }
+    if [[ "$port" != "$1" ]]; then
+        warn "端口 $1 被占用，改用端口 ${port}"
     fi
     (cd "$dir" && exec nohup python3 -m http.server "$port" --bind 0.0.0.0) >/dev/null 2>&1 < /dev/null &
     SERVER_PID=$!
