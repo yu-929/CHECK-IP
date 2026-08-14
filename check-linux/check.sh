@@ -126,7 +126,6 @@ run_interactive() {
     fi
 
     CONCURRENCY="$(read_input "请输入并发数" "$CONCURRENCY")"
-    OUTPUT_DIR="$(read_input "请输入输出目录" "$OUTPUT_DIR")"
 
     if ask_yesno "扫描完成后是否调用第三方 API 校验节点信息?" "n"; then
         RUN_VALIDATE=1
