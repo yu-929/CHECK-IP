@@ -127,13 +127,8 @@ run_interactive() {
 
     CONCURRENCY="$(read_input "请输入并发数" "$CONCURRENCY")"
 
-    if ask_yesno "扫描完成后是否调用第三方 API 校验节点信息?" "n"; then
-        RUN_VALIDATE=1
-    fi
-
-    if ask_yesno "扫描完成后是否启动 HTTP 下载服务（提供 CSV 下载链接）?" "n"; then
-        SERVE_PORT="$(read_input "请输入下载服务端口" "8000")"
-    fi
+    RUN_VALIDATE=1
+    SERVE_PORT="$(read_input "请输入下载服务端口" "8000")"
 
     echo ""
     banner "-------- 配置确认 --------"
@@ -261,7 +256,7 @@ start_download_server() {
         err "启动下载服务需要 python3"
         return 1
     fi
-    (cd "$dir" && exec python3 -m http.server "$port" --bind 0.0.0.0) >/dev/null 2>&1 &
+    (cd "$dir" && exec nohup python3 -m http.server "$port" --bind 0.0.0.0) >/dev/null 2>&1 < /dev/null &
     SERVER_PID=$!
     sleep 1
     if ! kill -0 "$SERVER_PID" 2>/dev/null; then
