@@ -174,3 +174,9 @@
 *.lz
 *.lzma
 *.iso
+
+# Scan output
+**/history/
+
+# Runtime pid
+**/.http_server.pid

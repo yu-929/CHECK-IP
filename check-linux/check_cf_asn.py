@@ -1,0 +1,441 @@
+import asyncio
+import ssl
+import sys
+import os
+import re
+import resource
+import json
+import ipaddress
+import urllib.request
+import socket
+
+DEFAULT_TARGETS = os.getenv("TARGET_LIST", os.getenv("ASN_LIST", "AS206300"))
+DEFAULT_PORTS = "443"
+CUSTOM_CF_DOMAIN = os.getenv("CUSTOM_CF_DOMAIN", "example.com")
+OUTPUT_DIR = os.getenv("OUTPUT_DIR", "history")
+
+CF_SNI_1 = "www.cloudflare.com"
+STAGE1_CONCURRENCY = int(os.getenv("SCAN_CONCURRENCY", "3000"))
+STAGE1_TIMEOUT = float(os.getenv("SCAN_TIMEOUT", "0.8"))
+
+CF_HOST_TEST = "crypto.cloudflare.com"
+STAGE2_TIMEOUT = float(os.getenv("SCAN_TIMEOUT_STAGE2", "2.0"))
+
+STAGE3_TIMEOUT = 2.0
+
+# 阶段二/三候选量小，使用更高的独立并发，不被阶段一限制
+STAGE2_CONCURRENCY = int(os.getenv("SCAN_CONCURRENCY_STAGE2", str(STAGE1_CONCURRENCY * 2)))
+
+try:
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+    soft = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+    print(f"[*] 系统 Socket 文件描述符上限已提升至: {soft}", flush=True)
+    STAGE1_CONCURRENCY = min(STAGE1_CONCURRENCY, max(64, soft // 2))
+    print(f"[*] 阶段一并发数调整为: {STAGE1_CONCURRENCY}", flush=True)
+except Exception as e:
+    print(f"[!] 提升文件描述符失败: {e}", flush=True)
+
+SSL_CTX = ssl.create_default_context()
+SSL_CTX.check_hostname = False
+SSL_CTX.verify_mode = ssl.CERT_NONE
+
+
+class QuietStreamReaderProtocol(asyncio.StreamReaderProtocol):
+    def eof_received(self):
+        return False
+
+    def connection_made(self, transport):
+        if self._transport is None:
+            super().connection_made(transport)
+            return
+        self._transport = transport
+        reader = self._stream_reader
+        if reader is not None and reader._transport is not None:
+            reader._transport = transport
+        self._over_ssl = transport.get_extra_info('sslcontext') is not None
+
+
+async def open_tls_connection(ip, port, sni, timeout_val):
+    """自定义 TLS 连接：TCP_NODELAY + 超时重试一次（仅 TCP 层超时重试）
+    返回 (reader, writer, latency_ms)，latency 为 TCP connect + TLS 握手总耗时"""
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    for attempt in range(2):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setblocking(False)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        try:
+            await asyncio.wait_for(loop.sock_connect(sock, (ip, port)), timeout=timeout_val)
+            break
+        except asyncio.TimeoutError:
+            sock.close()
+            if attempt == 0:
+                continue
+            raise
+        except OSError:
+            sock.close()
+            raise
+
+    reader = asyncio.StreamReader(limit=2 ** 16, loop=loop)
+    protocol = QuietStreamReaderProtocol(reader, loop=loop)
+    raw_transport = None
+    try:
+        raw_transport, _ = await loop.create_connection(lambda: protocol, sock=sock)
+        tls_transport = await asyncio.wait_for(
+            loop.start_tls(raw_transport, protocol, SSL_CTX, server_hostname=sni),
+            timeout=timeout_val
+        )
+        if tls_transport is None:
+            raise OSError(f"start_tls 返回 None，连接已关闭: {ip}:{port}")
+        writer = asyncio.StreamWriter(tls_transport, protocol, reader, loop)
+        latency_ms = (loop.time() - start) * 1000
+        return reader, writer, latency_ms
+    except Exception:
+        if raw_transport is not None:
+            raw_transport.abort()
+        raise
+
+
+def close_writer(writer):
+    """立即关闭连接，不做优雅 TLS 关闭握手，避免 wait_closed 堆积"""
+    if writer is None:
+        return
+    transport = writer.transport
+    if transport is not None and not transport.is_closing():
+        transport.abort()
+
+
+def parse_ports(port_str):
+    if not port_str:
+        return [443]
+    raw_ports = re.split(r'[\s,]+', str(port_str).strip())
+    ports = []
+    for p in raw_ports:
+        if p.isdigit() and 1 <= int(p) <= 65535:
+            ports.append(int(p))
+    return list(dict.fromkeys(ports)) if ports else [443]
+
+
+def expand_cidrs(cidr_list):
+    ip_list = []
+    for cidr in cidr_list:
+        cidr = cidr.strip()
+        if not cidr:
+            continue
+        try:
+            net = ipaddress.ip_network(cidr, strict=False)
+            if ':' in str(net.network_address):
+                print(f"[-] 跳过 IPv6 网段: {cidr}", flush=True)
+                continue
+            if net.prefixlen >= 31:
+                for ip in net:
+                    ip_list.append(str(ip))
+            else:
+                for ip in net.hosts():
+                    ip_list.append(str(ip))
+        except Exception:
+            print(f"[!] 无效 CIDR: {cidr}", flush=True)
+    return ip_list
+
+
+def get_ips_from_asn(asn_clean):
+    print(f"[*] 正在自动查询并拉取 AS{asn_clean} 的网段信息...", flush=True)
+    cidrs = []
+
+    try:
+        ripe_url = f"https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS{asn_clean}"
+        req = urllib.request.Request(ripe_url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=10) as response:
+            data = json.loads(response.read().decode())
+            prefixes = data.get("data", {}).get("prefixes", [])
+            for p in prefixes:
+                prefix = p.get("prefix")
+                if prefix and ":" not in prefix:
+                    cidrs.append(prefix)
+    except Exception as e:
+        print(f"[!] RIPE API 获取失败: {e}", flush=True)
+
+    if not cidrs:
+        try:
+            bgp_url = f"https://api.bgpview.io/asn/{asn_clean}/prefixes"
+            req = urllib.request.Request(bgp_url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=10) as response:
+                data = json.loads(response.read().decode())
+                ipv4_prefixes = data.get("data", {}).get("ipv4_prefixes", [])
+                for p in ipv4_prefixes:
+                    prefix = p.get("prefix")
+                    if prefix:
+                        cidrs.append(prefix)
+        except Exception as e:
+            print(f"[!] BGPView API 获取失败: {e}", flush=True)
+
+    ip_list = expand_cidrs(cidrs)
+    return ip_list
+
+
+def parse_targets(input_str):
+    raw_targets = [t.strip() for t in re.split(r'[\s,]+', input_str) if t.strip()]
+    all_ips = []
+
+    for item in raw_targets:
+        if item.endswith('.txt') and os.path.isfile(item):
+            try:
+                with open(item) as f:
+                    content = f.read()
+                all_ips.extend(parse_targets(content))
+                print(f"[+] 从文件 [{item}] 加载目标", flush=True)
+            except Exception as e:
+                print(f"[-] 读取文件失败: {item}: {e}", flush=True)
+            continue
+
+        try:
+            net = ipaddress.ip_network(item, strict=False)
+            if ':' in str(net.network_address):
+                print(f"[-] 跳过 IPv6 网段: {item}", flush=True)
+                continue
+            if net.prefixlen >= 31:
+                for ip in net:
+                    all_ips.append(str(ip))
+            else:
+                for ip in net.hosts():
+                    all_ips.append(str(ip))
+            print(f"[+] 识别为 IP/网段 [{item}]，展开出 {net.num_addresses} 个地址", flush=True)
+            continue
+        except ValueError:
+            pass
+
+        asn_clean = item.upper().replace("AS", "")
+        if asn_clean.isdigit():
+            ips = get_ips_from_asn(asn_clean)
+            print(f"[+] AS{asn_clean} 解析完成，提取出 {len(ips)} 个待测 IPv4 地址。", flush=True)
+            all_ips.extend(ips)
+        else:
+            print(f"[-] 无法识别的目标格式: {item}", flush=True)
+
+    unique_ips = list(dict.fromkeys(all_ips))
+    print(f"[+] 所有目标汇总去重后，共有 {len(unique_ips)} 个待测 IP 地址。", flush=True)
+    return unique_ips
+
+
+def match_domain_in_cert(sni_domain, cert_str):
+    sni_domain = sni_domain.lower()
+    cert_str = cert_str.lower()
+
+    if sni_domain in cert_str:
+        return True
+
+    parts = sni_domain.split(".")
+    if len(parts) >= 2:
+        main_domain = ".".join(parts[-2:])
+        wildcard_domain = f"*.{main_domain}"
+        if main_domain in cert_str or wildcard_domain in cert_str:
+            return True
+
+    if "cloudflare" in sni_domain and "cloudflare" in cert_str:
+        return True
+
+    return False
+
+
+async def check_tls_sni_async(ip, port, sni, timeout_val, sem, stats=None):
+    async with sem:
+        writer = None
+        try:
+            reader, writer, latency_ms = await open_tls_connection(ip, port, sni, timeout_val)
+
+            ssl_obj = writer.get_extra_info('ssl_object')
+            der_cert = ssl_obj.getpeercert(binary_form=True) if ssl_obj else None
+
+            if not der_cert:
+                return False, None, ''
+
+            tls_version = ssl_obj.version() if ssl_obj else ''
+            cert_str = der_cert.decode('latin1', errors='ignore').lower()
+            return match_domain_in_cert(sni, cert_str), latency_ms, tls_version
+        except asyncio.TimeoutError:
+            if stats is not None:
+                stats['timeout'] += 1
+            return False, None, ''
+        except ConnectionRefusedError:
+            if stats is not None:
+                stats['refused'] += 1
+            return False, None, ''
+        except ConnectionResetError:
+            if stats is not None:
+                stats['reset'] += 1
+            return False, None, ''
+        except OSError:
+            if stats is not None:
+                stats['other'] += 1
+            return False, None, ''
+        except Exception:
+            if stats is not None:
+                stats['other'] += 1
+            return False, None, ''
+        finally:
+            close_writer(writer)
+
+
+async def check_http_async(ip, port, host, timeout_val, sem):
+    async with sem:
+        writer = None
+        try:
+            reader, writer, latency_ms = await open_tls_connection(ip, port, host, timeout_val)
+
+            req = f"GET / HTTP/1.1\r\nHost: {host}\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n"
+            writer.write(req.encode('latin1'))
+            await writer.drain()
+
+            data = await asyncio.wait_for(reader.read(1024), timeout=timeout_val)
+
+            if not data:
+                return False, latency_ms
+
+            resp_str = data.decode('latin1', errors='ignore').lower()
+
+            has_redirect_code = "http/1.1 301" in resp_str or "http/1.1 302" in resp_str
+            has_location_header = "location:" in resp_str
+
+            return has_redirect_code and has_location_header, latency_ms
+        except Exception:
+            return False, None
+        finally:
+            close_writer(writer)
+
+
+async def run_stage1(targets, sem):
+    total = len(targets)
+    completed = 0
+    passed_items = []
+    BATCH_SIZE = 10000
+    stats = {"timeout": 0, "refused": 0, "reset": 0, "other": 0, "not_cf": 0}
+
+    step = max(1, total // 10)
+    last_printed_step = 0
+
+    print(f"\n[1/3 第一阶段 TLS 探测] 开始测试，共 {total} 个目标 (IP:端口组合)，分批调度每批 {BATCH_SIZE}...", flush=True)
+
+    async def worker(item):
+        nonlocal completed, last_printed_step
+        ip, port = item
+        ok, latency, tls_ver = await check_tls_sni_async(ip, port, CF_SNI_1, STAGE1_TIMEOUT, sem, stats)
+        completed += 1
+
+        if ok:
+            passed_items.append((ip, port, latency, tls_ver))
+        elif latency is None:
+            pass
+        else:
+            stats['not_cf'] += 1
+
+        current_step = completed // step
+        if current_step > last_printed_step or completed == total:
+            last_printed_step = current_step
+            percent = (completed / total) * 100
+            print(f"[1/3 进度] {completed}/{total} ({percent:.1f}%) | 当前通过: {len(passed_items)} 个", flush=True)
+
+    for i in range(0, total, BATCH_SIZE):
+        batch = targets[i:i + BATCH_SIZE]
+        await asyncio.gather(*(worker(item) for item in batch))
+
+    print(f"[1/3 结果] 通过 {len(passed_items)} | 超时 {stats['timeout']} | 拒绝 {stats['refused']} | "
+          f"重置 {stats['reset']} | 非CF证书 {stats['not_cf']} | 其他 {stats['other']}", flush=True)
+    return passed_items
+
+
+async def run_batched(items, coro_factory, batch_size=10000):
+    results = []
+    for i in range(0, len(items), batch_size):
+        batch = items[i:i + batch_size]
+        results.extend(await asyncio.gather(*(coro_factory(item) for item in batch)))
+    return results
+
+
+async def main():
+    target_input = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_TARGETS
+    ports_input = sys.argv[2] if len(sys.argv) > 2 else DEFAULT_PORTS
+
+    target_ports = parse_ports(ports_input)
+    print(f"[*] 目标输入: {target_input} | 端口列表: {target_ports}", flush=True)
+    all_ips = parse_targets(target_input)
+
+    if not all_ips:
+        print("[-] 未能获取到任何待测 IP，程序退出。", flush=True)
+        return
+
+    if len(all_ips) > 50000:
+        print(f"[!] 待测 IP 超过 50000 个 ({len(all_ips)})，继续可能超时。建议使用更小的网段。", flush=True)
+
+    targets = [(ip, port) for ip in all_ips for port in target_ports]
+    print(f"[*] 解析完成：{len(all_ips)} 个 IP × {len(target_ports)} 个端口 {target_ports} = 共有 {len(targets)} 个连接目标。", flush=True)
+
+    sem = asyncio.Semaphore(STAGE1_CONCURRENCY)
+    sem_stage2 = asyncio.Semaphore(STAGE2_CONCURRENCY)
+
+    pass_1 = await run_stage1(targets, sem)
+    print(f"[+] 第一阶段完成！匹配 CF 证书保留目标: {len(pass_1)} 个\n", flush=True)
+
+    if not pass_1:
+        print("[-] 无有效 IP:端口 通过第一阶段。", flush=True)
+        return
+
+    print(f"[2/3 第二阶段 HTTP 校验] 正在快速校验 {len(pass_1)} 个候选目标...", flush=True)
+    res2 = await run_batched(
+        pass_1,
+        lambda item: check_http_async(item[0], item[1], CF_HOST_TEST, STAGE2_TIMEOUT, sem_stage2)
+    )
+    pass_2 = [pass_1[i] for i, ok in enumerate(res2) if ok[0]]
+    print(f"[+] 第二阶段完成！可用 301 重定向目标: {len(pass_2)} 个\n", flush=True)
+
+    if not pass_2:
+        print("[-] 无有效 IP:端口 通过第二阶段。", flush=True)
+        return
+
+    final_items = pass_2
+    if CUSTOM_CF_DOMAIN and CUSTOM_CF_DOMAIN.strip():
+        domain = CUSTOM_CF_DOMAIN.strip()
+        print(f"[3/3 第三阶段自定义域名校验] 正在校验域名 {domain}...", flush=True)
+        res3 = await run_batched(
+            pass_2,
+            lambda item: check_tls_sni_async(item[0], item[1], domain, STAGE3_TIMEOUT, sem_stage2)
+        )
+        final_items = [pass_2[i] for i, ok in enumerate(res3) if ok[0]]
+        print(f"[+] 第三阶段完成！支持自定义托管域名的优选反代 IP: {len(final_items)} 个", flush=True)
+    else:
+        print("[3/3] 未检测到 CUSTOM_CF_DOMAIN，自动跳过第三阶段。", flush=True)
+
+    # 按握手延迟升序排序（优选最快的节点），延迟相同再按 IP
+    final_items = sorted(final_items, key=lambda x: (x[2] if x[2] is not None else float('inf'), ipaddress.ip_address(x[0]), x[1]))
+
+    print("\n==================== 扫描结束 ====================", flush=True)
+    print(f"最终有效目标总数: {len(final_items)}", flush=True)
+    print("延迟最快的 10 个节点:")
+    for ip, port, latency, tls_ver in final_items[:10]:
+        tls_flag = 'TRUE' if tls_ver else 'FALSE'
+        print(f"  {ip}:{port}  {latency:.0f}ms  TLS={tls_flag}", flush=True)
+
+    clean_name = re.sub(r'[^\w\.-]', '_', target_input.split(',')[0].strip())
+    if clean_name.lower().endswith(".txt"):
+        clean_name = os.path.basename(clean_name)[:-4]
+    output_filename = f"{clean_name}.txt"
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    output_path = os.path.join(OUTPUT_DIR, output_filename)
+    with open(output_path, "w", encoding="utf-8") as f:
+        for ip, port, _latency, _tls in final_items:
+            f.write(f"{ip}:{port}\n")
+
+    meta_path = os.path.join(OUTPUT_DIR, f"{clean_name}_meta.txt")
+    with open(meta_path, "w", encoding="utf-8") as f:
+        for ip, port, latency, tls_ver in final_items:
+            tls_flag = 'TRUE' if tls_ver else 'FALSE'
+            f.write(f"{ip}:{port} {latency:.0f} {tls_flag}\n")
+
+    print(f"\n[+] 最终结果已按延迟排序保存至：{output_path} (格式为 IP:PORT)", flush=True)
+    print(f"[+] 节点元数据已保存至：{meta_path} (格式为 IP:PORT 延迟ms TLS[TRUE/FALSE])", flush=True)
+
+    await asyncio.sleep(0.5)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
