@@ -76,6 +76,7 @@ cd CHECK-IP && git pull
   -p, --ports <端口>     端口列表 (默认: 443)
   -d, --domain <域名>    自定义 CF 域名，启用第三阶段校验
   -c, --concurrency <N>  阶段一并发数 (默认: 3000)
+  -w, --workers <N>      多进程并行数，利用多核加速 (默认: 1)
   -o, --output <目录>    结果输出目录 (默认: history)
   -v, --validate         扫描后校验节点信息
   -s, --serve <端口>     扫描后启动 HTTP 下载服务
@@ -90,6 +91,7 @@ cd CHECK-IP && git pull
 ./check.sh -t "AS206300 AS13335" -p "443,13720" -c 5000
 ./check.sh -t 16.162.0.0/16 -p 443 -d example.com -v
 ./check.sh -t targets.txt -p 443 -v -s 8000
+./check.sh -t 129.153.0.0/16 -p 28863 -w 4   # 4 进程并行扫大网段
 ```
 
 ### 结果文件

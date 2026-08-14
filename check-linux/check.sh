@@ -33,6 +33,7 @@ PORTS="${DEFAULT_PORTS:-443}"
 DOMAIN="${CUSTOM_CF_DOMAIN:-}"
 CONCURRENCY="${SCAN_CONCURRENCY:-3000}"
 OUTPUT_DIR="${OUTPUT_DIR:-history}"
+WORKERS="${SCAN_WORKERS:-1}"
 RUN_VALIDATE=0
 INTERACTIVE=0
 SERVE_PORT=""
@@ -49,20 +50,22 @@ ${C_BOLD}Cloudflare 优选 IP 扫描（Linux CLI）${C_RESET}
   -t, --target <目标>  目标: ASN / CIDR / IP / .txt 文件，可混合，空格或逗号分隔 (默认: AS206300)
   -p, --ports <端口>   端口列表，空格或逗号分隔 (默认: 443)
   -d, --domain <域名>  自定义 CF 域名，启用第三阶段域名校验
-  -c, --concurrency <N> 阶段一并发数 (默认: 2000)
+  -c, --concurrency <N> 阶段一并发数 (默认: 3000)
+  -w, --workers <N>     多进程并行数，利用多核加速 (默认: 1，建议 CPU 核数)
   -o, --output <目录>  结果输出目录 (默认: history)
   -v, --validate       扫描后自动运行 validate.py 校验节点信息
   -s, --serve <端口>   扫描完成后启动 HTTP 下载服务，提供 CSV 下载链接
   --install            安装为系统命令 ck (软链到 /usr/local/bin/ck)
   -h, --help           显示帮助
 
-环境变量: TARGET_LIST / ASN_LIST / CUSTOM_CF_DOMAIN / OUTPUT_DIR / SCAN_CONCURRENCY
+环境变量: TARGET_LIST / ASN_LIST / CUSTOM_CF_DOMAIN / OUTPUT_DIR / SCAN_CONCURRENCY / SCAN_WORKERS
 
 示例:
   ./check.sh                              # 进入交互模式
   ./check.sh -t AS206300 -p 443           # 参数模式，按 ASN 扫描
   ./check.sh -t "AS206300 AS13335" -p "443,13720" -c 5000
   ./check.sh -t 16.162.0.0/16 -p 443 -d example.com -v -s 8000
+  ./check.sh -t 16.162.0.0/16 -p 443 -w 4   # 4 进程并行扫描大网段
 EOF
 }
 
@@ -87,6 +90,7 @@ while [[ $# -gt 0 ]]; do
         -p|--ports) PORTS="$2"; shift 2 ;;
         -d|--domain) DOMAIN="$2"; shift 2 ;;
         -c|--concurrency) CONCURRENCY="$2"; shift 2 ;;
+        -w|--workers) WORKERS="$2"; shift 2 ;;
         -o|--output) OUTPUT_DIR="$2"; shift 2 ;;
         -v|--validate) RUN_VALIDATE=1; shift ;;
         -s|--serve) SERVE_PORT="$2"; shift 2 ;;
@@ -141,6 +145,7 @@ run_interactive() {
     fi
 
     CONCURRENCY="$(read_input "请输入并发数" "$CONCURRENCY")"
+    WORKERS="$(read_input "请输入并行进程数 (多核加速，建议 CPU 核数)" "$WORKERS")"
 
     RUN_VALIDATE=1
     SERVE_PORT=8000
@@ -151,6 +156,7 @@ run_interactive() {
     info "端口:       ${C_BOLD}${PORTS}${C_RESET}"
     [[ -n "$DOMAIN" ]] && info "自定义域名: ${C_BOLD}${DOMAIN}${C_RESET}" || info "自定义域名: ${C_DIM}(未启用)${C_RESET}"
     info "并发数:     ${C_BOLD}${CONCURRENCY}${C_RESET}"
+    info "并行进程:   ${C_BOLD}${WORKERS}${C_RESET}"
     info "输出目录:   ${C_BOLD}${OUTPUT_DIR}${C_RESET}"
     info "自动校验:   ${C_BOLD}$([[ "$RUN_VALIDATE" -eq 1 ]] && echo 是 || echo 否)${C_RESET}"
     info "下载服务:   ${C_BOLD}$([[ -n "$SERVE_PORT" ]] && echo "端口 ${SERVE_PORT}" || echo 否)${C_RESET}"
@@ -338,6 +344,11 @@ fi
 python3 -c "import asyncio, ssl, ipaddress, resource" 2>/dev/null \
     || { err "Python 缺少必要标准库，请检查 Python 安装"; exit 1; }
 
+# ---------------- 运行交互向导 ----------------
+if [[ "$INTERACTIVE" -eq 1 ]]; then
+    run_interactive
+fi
+
 # 提升文件描述符上限（Linux 并发扫描需要大量 socket）
 CURRENT_LIMIT="$(ulimit -n)"
 DESIRED_LIMIT=$((CONCURRENCY * 2 + 512))
@@ -350,11 +361,6 @@ if [[ "$CURRENT_LIMIT" -lt "$DESIRED_LIMIT" ]]; then
     fi
 else
     log "当前文件描述符上限: ${CURRENT_LIMIT}"
-fi
-
-# ---------------- 运行交互向导 ----------------
-if [[ "$INTERACTIVE" -eq 1 ]]; then
-    run_interactive
 fi
 
 # ---------------- 执行扫描 ----------------
@@ -376,6 +382,7 @@ EXPORT_ENV=()
 [[ -n "$DOMAIN" ]] && EXPORT_ENV+=("CUSTOM_CF_DOMAIN=$DOMAIN")
 EXPORT_ENV+=("OUTPUT_DIR=$OUTPUT_DIR")
 EXPORT_ENV+=("SCAN_CONCURRENCY=$CONCURRENCY")
+EXPORT_ENV+=("SCAN_WORKERS=$WORKERS")
 [[ -n "${SCAN_TIMEOUT:-}" ]] && EXPORT_ENV+=("SCAN_TIMEOUT=$SCAN_TIMEOUT")
 [[ -n "${SCAN_TIMEOUT_STAGE2:-}" ]] && EXPORT_ENV+=("SCAN_TIMEOUT_STAGE2=$SCAN_TIMEOUT_STAGE2")
 [[ -n "${SCAN_CONCURRENCY_STAGE2:-}" ]] && EXPORT_ENV+=("SCAN_CONCURRENCY_STAGE2=$SCAN_CONCURRENCY_STAGE2")

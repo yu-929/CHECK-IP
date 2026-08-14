@@ -8,6 +8,7 @@ import json
 import ipaddress
 import urllib.request
 import socket
+import multiprocessing
 
 DEFAULT_TARGETS = os.getenv("TARGET_LIST", os.getenv("ASN_LIST", "AS206300"))
 DEFAULT_PORTS = "443"
@@ -25,6 +26,9 @@ STAGE3_TIMEOUT = 2.0
 
 # 阶段二/三候选量小，使用更高的独立并发，不被阶段一限制
 STAGE2_CONCURRENCY = int(os.getenv("SCAN_CONCURRENCY_STAGE2", str(STAGE1_CONCURRENCY * 2)))
+
+# 多进程并行：利用多核加速第一阶段（默认单进程，需显式设置 WORKERS）
+SCAN_WORKERS = int(os.getenv("SCAN_WORKERS", "1"))
 
 try:
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
@@ -304,7 +308,7 @@ async def check_http_async(ip, port, host, timeout_val, sem):
             close_writer(writer)
 
 
-async def run_stage1(targets, sem):
+async def run_stage1(targets, sem, worker_label="1/3"):
     total = len(targets)
     completed = 0
     passed_items = []
@@ -314,7 +318,7 @@ async def run_stage1(targets, sem):
     step = max(1, total // 10)
     last_printed_step = 0
 
-    print(f"\n[1/3 第一阶段 TLS 探测] 开始测试，共 {total} 个目标 (IP:端口组合)，分批调度每批 {BATCH_SIZE}...", flush=True)
+    print(f"\n[{worker_label} 第一阶段 TLS 探测] 开始测试，共 {total} 个目标 (IP:端口组合)，分批调度每批 {BATCH_SIZE}...", flush=True)
 
     async def worker(item):
         nonlocal completed, last_printed_step
@@ -333,15 +337,46 @@ async def run_stage1(targets, sem):
         if current_step > last_printed_step or completed == total:
             last_printed_step = current_step
             percent = (completed / total) * 100
-            print(f"[1/3 进度] {completed}/{total} ({percent:.1f}%) | 当前通过: {len(passed_items)} 个", flush=True)
+            print(f"[{worker_label} 进度] {completed}/{total} ({percent:.1f}%) | 当前通过: {len(passed_items)} 个", flush=True)
 
     for i in range(0, total, BATCH_SIZE):
         batch = targets[i:i + BATCH_SIZE]
         await asyncio.gather(*(worker(item) for item in batch))
 
-    print(f"[1/3 结果] 通过 {len(passed_items)} | 超时 {stats['timeout']} | 拒绝 {stats['refused']} | "
+    print(f"[{worker_label} 结果] 通过 {len(passed_items)} | 超时 {stats['timeout']} | 拒绝 {stats['refused']} | "
           f"重置 {stats['reset']} | 非CF证书 {stats['not_cf']} | 其他 {stats['other']}", flush=True)
     return passed_items
+
+
+# 子进程入口：对目标分片运行第一阶段，返回通过列表
+def _stage1_worker_process(targets_chunk, worker_label, concurrency, timeout):
+    import asyncio
+    global STAGE1_TIMEOUT
+    STAGE1_TIMEOUT = timeout
+    sem = asyncio.Semaphore(concurrency)
+    return asyncio.run(run_stage1(targets_chunk, sem, worker_label))
+
+
+def run_stage1_parallel(targets, workers, concurrency, timeout):
+    """多进程并行第一阶段：将目标均分到 workers 个子进程"""
+    if workers <= 1 or len(targets) <= 1000:
+        sem = asyncio.Semaphore(concurrency)
+        return asyncio.run(run_stage1(targets, sem))
+
+    chunk_size = (len(targets) + workers - 1) // workers
+    per_worker_conc = max(64, concurrency // workers)
+    chunks = []
+    for i in range(0, len(targets), chunk_size):
+        chunks.append((targets[i:i + chunk_size], f"W{i // chunk_size + 1}/{workers}", per_worker_conc, timeout))
+
+    print(f"[*] 多进程并行加速: {workers} 个进程 × 并发 {per_worker_conc}", flush=True)
+    with multiprocessing.Pool(workers) as pool:
+        results = pool.starmap(_stage1_worker_process, chunks)
+
+    passed = []
+    for r in results:
+        passed.extend(r)
+    return passed
 
 
 async def run_batched(items, coro_factory, batch_size=10000):
@@ -373,7 +408,9 @@ async def main():
     sem = asyncio.Semaphore(STAGE1_CONCURRENCY)
     sem_stage2 = asyncio.Semaphore(STAGE2_CONCURRENCY)
 
-    pass_1 = await run_stage1(targets, sem)
+    pass_1 = await asyncio.to_thread(
+        run_stage1_parallel, targets, SCAN_WORKERS, STAGE1_CONCURRENCY, STAGE1_TIMEOUT
+    )
     print(f"[+] 第一阶段完成！匹配 CF 证书保留目标: {len(pass_1)} 个\n", flush=True)
 
     if not pass_1:
